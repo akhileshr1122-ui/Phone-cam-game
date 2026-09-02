@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+<title>MoveBox</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2/dist/pose-detection.min.js"></script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:100%; height:100%; background:#06070B; overflow:hidden; font-family: "Segoe UI", Roboto, system-ui, sans-serif; color:#fff; }
+  #v { position:absolute; opacity:0; width:1px; height:1px; pointer-events:none; }
+  #c { position:absolute; inset:0; width:100%; height:100%; touch-action:none; }
+  #start { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:28px; background:#06070B; text-align:center; padding:24px; }
+  #start h1 { font-size:clamp(52px, 12vw, 120px); font-weight:900; letter-spacing:-0.04em; line-height:.9; }
+  #start h1 span { display:block; color:#FFB020; }
+  #start p { max-width:34ch; font-size:clamp(15px,2.4vw,22px); line-height:1.45; color:#B9BDD0; }
+  #start button { font: 900 clamp(20px,3.5vw,30px)/1 inherit; padding:20px 44px; border:0; border-radius:999px; background:#FFB020; color:#1A1000; cursor:pointer; }
+  #start button:active { transform:scale(.97); }
+  #status { color:#7C819A; font-size:15px; min-height:1.4em; }
+  @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
+</style>
+</head>
+<body>
+<video id="v" playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="start">
+  <h1>Move<span>Box</span></h1>
+  <p>Stand 2–3 m from the phone so your whole body is in frame. Point the front camera at yourself and play on the big screen.</p>
+  <button id="go">Turn on camera</button>
+  <div id="status"></div>
+</div>
+
+<script>
+// ---------- Setup ----------
+const video = document.getElementById('v');
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const startEl = document.getElementById('start');
+const statusEl = document.getElementById('status');
+const AMBER = '#FFB020', INK = '#3B4CFF', RED = '#FF3D5A', WHITE = '#FFFFFF';
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener('resize', resize); resize();
+
+// ---------- Pose ----------
+let detector = null;
+const KP = {};                        // smoothed keypoints, normalized + mirrored
+let poseSeen = false;
+async function poseLoop() {
+  for (;;) {
+    if (video.readyState >= 2) {
+      try {
+        const poses = await detector.estimatePoses(video, { maxPoses: 1 });
+        const p = poses[0];
+        poseSeen = !!p;
+        if (p) for (const k of p.keypoints) {
+          const nx = 1 - k.x / video.videoWidth, ny = k.y / video.videoHeight;
+          const q = KP[k.name] || (KP[k.name] = { x: nx, y: ny, s: 0 });
+          q.x += (nx - q.x) * 0.55; q.y += (ny - q.y) * 0.55; q.s = k.score;
+        }
+      } catch (e) { console.error(e); }
+    }
+    await new Promise(r => setTimeout(r, 0));
+  }
+}
+function fit() {                      // where the mirrored video is drawn on screen (cover)
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const s = Math.max(W / vw, H / vh);
+  const dw = vw * s, dh = vh * s;
+  return { dx: (W - dw) / 2, dy: (H - dh) / 2, dw, dh };
+}
+function S(p) { const f = fit(); return { x: f.dx + p.x * f.dw, y: f.dy + p.y * f.dh, s: p.s }; }
+function kp(name, min = 0.35) { const p = KP[name]; return p && p.s >= min ? p : null; }
+function body() {
+  const ls = kp('left_shoulder'), rs = kp('right_shoulder');
+  if (!ls || !rs) return null;
+  return { cx: (ls.x + rs.x) / 2, sy: (ls.y + rs.y) / 2, span: Math.hypot(ls.x - rs.x, ls.y - rs.y) };
+}
+function hands() {
+  return [kp('left_wrist'), kp('right_wrist')].filter(Boolean).map(S);
+}
+
+// ---------- State ----------
+let state = 'menu';
+let last = performance.now();
+const cal = { sy: null, span: null, t: 0 };
+let pending = null;
+let game = null;
+const hover = { key: null, t: 0 };
+let flash = 0;
+
+// ---------- Drawing helpers ----------
+function txt(s, x, y, size, opts = {}) {
+  ctx.font = `900 ${size}px "Segoe UI", Roboto, system-ui, sans-serif`;
+  ctx.textAlign = opts.align || 'center'; ctx.textBaseline = opts.base || 'middle';
+  ctx.lineJoin = 'round'; ctx.lineWidth = size * 0.18; ctx.strokeStyle = 'rgba(0,0,0,.85)';
+  ctx.strokeText(s, x, y);
+  ctx.fillStyle = opts.color || WHITE; ctx.fillText(s, x, y);
+}
+function rr(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function drawCamera(dim) {
+  ctx.fillStyle = '#06070B'; ctx.fillRect(0, 0, W, H);
+  if (video.readyState >= 2) {
+    const f = fit();
+    ctx.save(); ctx.translate(f.dx + f.dw, f.dy); ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, f.dw, f.dh); ctx.restore();
+  }
+  ctx.fillStyle = `rgba(6,7,11,${dim})`; ctx.fillRect(0, 0, W, H);
+}
+function drawSkeleton() {
+  const pairs = [['left_shoulder','right_shoulder'],['left_shoulder','left_elbow'],['left_elbow','left_wrist'],
+    ['right_shoulder','right_elbow'],['right_elbow','right_wrist'],['left_shoulder','left_hip'],['right_shoulder','right_hip'],
+    ['left_hip','right_hip'],['left_hip','left_knee'],['left_knee','left_ankle'],['right_hip','right_knee'],['right_knee','right_ankle']];
+  ctx.lineCap = 'round'; ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(255,255,255,.55)';
+  for (const [a, b] of pairs) { const p = kp(a), q = kp(b); if (!p || !q) continue; const A = S(p), B = S(q); ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke(); }
+  for (const h of hands()) {
+    ctx.beginPath(); ctx.arc(h.x, h.y, 26, 0, Math.PI * 2); ctx.fillStyle = 'rgba(255,176,32,.35)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(h.x, h.y, 14, 0, Math.PI * 2); ctx.fillStyle = AMBER; ctx.fill();
+  }
+}
+// Buttons you select by holding a hand over them (or tapping)
+function buttons(list, dt) {
+  const hs = hands();
+  let active = null;
+  for (const b of list) {
+    const inside = hs.some(h => h.x > b.x && h.x < b.x + b.w && h.y > b.y && h.y < b.y + b.h);
+    if (inside) active = b;
+    rr(b.x, b.y, b.w, b.h, 22);
+    ctx.fillStyle = inside ? 'rgba(255,176,32,.28)' : 'rgba(6,7,11,.6)'; ctx.fill();
+    ctx.lineWidth = 4; ctx.strokeStyle = inside ? AMBER : 'rgba(255,255,255,.35)'; ctx.stroke();
+    txt(b.label, b.x + b.w / 2, b.y + b.h / 2 - (b.sub ? 10 : 0), Math.min(40, b.h * 0.3));
+    if (b.sub) txt(b.sub, b.x + b.w / 2, b.y + b.h / 2 + 26, 18, { color: '#C9CCDD' });
+  }
+  if (active) {
+    if (hover.key !== active.label) { hover.key = active.label; hover.t = 0; }
+    hover.t += dt;
+    const p = Math.min(1, hover.t / 1.1);
+    ctx.beginPath(); ctx.lineWidth = 8; ctx.strokeStyle = AMBER;
+    ctx.arc(active.x + active.w / 2, active.y + active.h - 28, 16, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2); ctx.stroke();
+    if (p >= 1) { hover.key = null; hover.t = 0; active.action(); }
+  } else { hover.key = null; hover.t = 0; }
+  return list;
+}
+let liveButtons = [];
+cv.addEventListener('pointerdown', e => {
+  for (const b of liveButtons) if (e.clientX > b.x && e.clientX < b.x + b.w && e.clientY > b.y && e.clientY < b.y + b.h) b.action();
+});
+
+// ---------- Screens ----------
+function startCal(next) { pending = next; cal.t = 0; state = 'calibrate'; }
+
+function menu(dt) {
+  drawCamera(0.55); drawSkeleton();
+  txt('MoveBox', W / 2, H * 0.16, Math.min(96, W * 0.11));
+  txt(poseSeen ? 'Hold a hand over a game to pick it' : 'Step back until your whole body is visible', W / 2, H * 0.29, 24, { color: '#C9CCDD' });
+  const bw = Math.min(380, W * 0.4), bh = Math.min(210, H * 0.34), gap = Math.min(60, W * 0.06);
+  const y = H * 0.42;
+  liveButtons = buttons([
+    { label: 'Lane Dash', sub: 'Step, jump, and duck', x: W / 2 - bw - gap / 2, y, w: bw, h: bh, action: () => startCal('runner') },
+    { label: 'Punch Out', sub: 'Hit the targets fast', x: W / 2 + gap / 2, y, w: bw, h: bh, action: () => startCal('punch') },
+  ], dt);
+}
+
+function calibrate(dt) {
+  drawCamera(0.45); drawSkeleton();
+  const b = body(); const hips = kp('left_hip') && kp('right_hip');
+  if (b && hips) {
+    cal.t += dt;
+    txt('Stand still', W / 2, H * 0.2, 56);
+    txt(String(Math.max(1, Math.ceil(3 - cal.t))), W / 2, H * 0.5, 180, { color: AMBER });
+    if (cal.t >= 3) { cal.sy = b.sy; cal.span = b.span; newGame(pending); }
+  } else {
+    cal.t = 0;
+    txt('Step back', W / 2, H * 0.42, 64);
+    txt('Shoulders and hips need to be in frame', W / 2, H * 0.55, 26, { color: '#C9CCDD' });
+  }
+  liveButtons = [];
+}
+
+// Body → action reading, scale-invariant using shoulder width
+function moves() {
+  const b = body(); if (!b) return { lane: 1, jump: false, duck: false };
+  const rise = (cal.sy - b.sy) / cal.span, drop = (b.sy - cal.sy) / cal.span;
+  return { lane: b.cx < 0.38 ? 0 : b.cx > 0.62 ? 2 : 1, jump: rise > 0.45, duck: drop > 0.8 };
+}
+
+function newGame(kind) {
+  state = kind; flash = 0;
+  if (kind === 'runner') game = { score: 0, lives: 3, t: 0, obs: [], spawn: 1.2, speed: 320 };
+  if (kind === 'punch') game = { score: 0, t: 60, targets: [], spawn: 0.5, combo: 0, best: 0 };
+}
+
+function runner(dt) {
+  const g = game; g.t += dt;
+  const m = moves();
+  drawCamera(0.62);
+  const laneW = Math.min(W * 0.22, 260), x0 = W / 2 - laneW * 1.5, py = H * 0.82;
+  // lanes
+  for (let i = 0; i < 3; i++) { ctx.fillStyle = i === m.lane ? 'rgba(255,176,32,.14)' : 'rgba(255,255,255,.05)'; ctx.fillRect(x0 + i * laneW, 0, laneW - 6, H); }
+  // spawn
+  g.spawn -= dt;
+  if (g.spawn <= 0) {
+    const r = Math.random(); const type = r < 0.55 ? 'block' : r < 0.8 ? 'low' : 'high';
+    g.obs.push({ type, lane: Math.floor(Math.random() * 3), y: -80, hit: false, passed: false });
+    g.spawn = Math.max(0.65, 1.5 - g.t * 0.02);
+  }
+  g.speed = 320 + g.t * 12;
+  // obstacles
+  for (const o of g.obs) {
+    o.y += g.speed * dt;
+    if (o.type === 'block') { ctx.fillStyle = INK; rr(x0 + o.lane * laneW + 16, o.y - 40, laneW - 38, 80, 14); ctx.fill(); }
+    else if (o.type === 'low') { ctx.fillStyle = RED; rr(x0 + 8, o.y - 12, laneW * 3 - 22, 24, 12); ctx.fill(); txt('JUMP', W / 2, o.y - 34, 22, { color: RED }); }
+    else { ctx.fillStyle = WHITE; rr(x0 + 8, o.y - 14, laneW * 3 - 22, 28, 14); ctx.fill(); txt('DUCK', W / 2, o.y - 36, 22); }
+    if (!o.hit && !o.passed && Math.abs(o.y - py) < 40) {
+      const collide = o.type === 'block' ? o.lane === m.lane : o.type === 'low' ? !m.jump : !m.duck;
+      if (collide) { o.hit = true; g.lives--; flash = 0.4; if (navigator.vibrate) navigator.vibrate(120); }
+      else { o.passed = true; g.score += 25; }
+    }
+  }
+  g.obs = g.obs.filter(o => o.y < H + 100);
+  g.score += dt * 8;
+  // player
+  const px = x0 + m.lane * laneW + laneW / 2, lift = m.jump ? -90 : 0, squash = m.duck ? 0.5 : 1;
+  ctx.beginPath(); ctx.ellipse(px, py + lift, 34, 34 * squash, 0, 0, Math.PI * 2);
+  ctx.fillStyle = AMBER; ctx.shadowColor = AMBER; ctx.shadowBlur = 30; ctx.fill(); ctx.shadowBlur = 0;
+  txt(m.jump ? 'jump!' : m.duck ? 'duck!' : '', px, py + lift - 60, 24, { color: AMBER });
+  // HUD
+  txt(String(Math.floor(g.score)), 32, 40, 48, { align: 'left' });
+  txt('♥'.repeat(g.lives) + '♡'.repeat(3 - g.lives), W - 32, 40, 40, { align: 'right', color: RED });
+  liveButtons = [];
+  if (g.lives <= 0) { game.final = Math.floor(g.score); state = 'over'; }
+}
+
+function punch(dt) {
+  const g = game; g.t -= dt;
+  drawCamera(0.55); drawSkeleton();
+  g.spawn -= dt;
+  if (g.spawn <= 0 && g.targets.length < 4) {
+    const r = 46 + Math.random() * 20;
+    g.targets.push({ x: r + 60 + Math.random() * (W - 2 * r - 120), y: r + 90 + Math.random() * (H * 0.55), r, life: 2.6, max: 2.6 });
+    g.spawn = 0.75;
+  }
+  const hs = hands();
+  for (const t of g.targets) {
+    t.life -= dt;
+    const p = t.life / t.max;
+    ctx.beginPath(); ctx.arc(t.x, t.y, t.r, 0, Math.PI * 2); ctx.fillStyle = 'rgba(59,76,255,.85)'; ctx.fill();
+    ctx.beginPath(); ctx.lineWidth = 8; ctx.strokeStyle = WHITE; ctx.arc(t.x, t.y, t.r + 10, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2); ctx.stroke();
+    if (hs.some(h => Math.hypot(h.x - t.x, h.y - t.y) < t.r + 26)) {
+      t.hit = true; g.combo++; g.best = Math.max(g.best, g.combo); g.score += 10 * Math.min(5, g.combo);
+      if (navigator.vibrate) navigator.vibrate(40);
+    }
+    if (t.life <= 0) { t.hit = true; g.combo = 0; }
+  }
+  g.targets = g.targets.filter(t => !t.hit);
+  txt(String(g.score), 32, 40, 48, { align: 'left' });
+  txt(Math.ceil(g.t) + 's', W - 32, 40, 48, { align: 'right', color: g.t < 10 ? RED : WHITE });
+  if (g.combo > 1) txt(`×${Math.min(5, g.combo)} combo`, W / 2, 40, 30, { color: AMBER });
+  liveButtons = [];
+  if (g.t <= 0) { game.final = g.score; state = 'over'; }
+}
+
+function over(dt) {
+  drawCamera(0.7); drawSkeleton();
+  txt(pending === 'runner' ? 'Lane Dash' : 'Punch Out', W / 2, H * 0.14, 34, { color: '#C9CCDD' });
+  txt(String(game.final), W / 2, H * 0.32, 130, { color: AMBER });
+  if (game.best) txt(`best combo ×${Math.min(5, game.best)}`, W / 2, H * 0.47, 26, { color: '#C9CCDD' });
+  const bw = Math.min(340, W * 0.38), bh = Math.min(130, H * 0.22), gap = 40, y = H * 0.6;
+  liveButtons = buttons([
+    { label: 'Play again', x: W / 2 - bw - gap / 2, y, w: bw, h: bh, action: () => newGame(pending) },
+    { label: 'Menu', x: W / 2 + gap / 2, y, w: bw, h: bh, action: () => { state = 'menu'; } },
+  ], dt);
+}
+
+// ---------- Main loop ----------
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  ({ menu, calibrate, runner, punch, over })[state](dt);
+  if (flash > 0) { flash -= dt; ctx.fillStyle = `rgba(255,61,90,${flash})`; ctx.fillRect(0, 0, W, H); }
+  requestAnimationFrame(frame);
+}
+
+// ---------- Boot ----------
+document.getElementById('go').addEventListener('click', async () => {
+  try {
+    statusEl.textContent = 'Opening camera…';
+    try { await document.documentElement.requestFullscreen(); } catch (e) {}
+    try { await screen.orientation.lock('landscape'); } catch (e) {}
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    video.srcObject = stream; await video.play();
+    statusEl.textContent = 'Loading body tracker…';
+    await tf.setBackend('webgl'); await tf.ready();
+    detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet,
+      { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING });
+    startEl.remove(); resize();
+    poseLoop(); last = performance.now(); requestAnimationFrame(frame);
+  } catch (err) {
+    statusEl.textContent = err.name === 'NotAllowedError'
+      ? 'Camera access was blocked. Allow the camera for this page in Chrome and try again.'
+      : 'Could not start: ' + err.message + ' (check you have internet for the first load)';
+  }
+});
+</script>
+</body>
+</html>
